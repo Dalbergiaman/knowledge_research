@@ -6,12 +6,12 @@ load_dotenv(dotenv_path='rag/.env')
 # milvus configuration
 MILVUS_HOST = os.getenv('MILVUS_HOST', 'localhost')
 MILVUS_PORT = int(os.getenv('MILVUS_PORT', 19530))
-COLLECTION_NAME = os.getenv('COLLECTION_NAME', 'ai_knowledge_base')
+COLLECTION_NAME = os.getenv('COLLECTION_NAME', 'ai_knowledge_database')
 EMBEDDING_DIMENSION = int(os.getenv('EMBEDDING_DIMENSION', 1024))
 
 # 阿里云配置
 DASHSCOPE_API_KEY = os.getenv('DASHSCOPE_API_KEY')
-EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', 'text-embedding-V4')
+EMBEDDING_MODEL = os.getenv('EMBEDDING_MODEL', 'text-embedding-v4')
 EMBEDDING_BASE_URL = os.getenv('EMBEDDING_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1')
 
 # 配置索引
