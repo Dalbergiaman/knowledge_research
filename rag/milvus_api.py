@@ -87,36 +87,145 @@ async def query(request: QueryRequest):
     """
     查询相似文档
     """
-    if not utility.has_collection(config.COLLECTION_NAME):
-        raise HTTPException(status_code=404, detail=f"集合 {config.COLLECTION_NAME} 不存在")
-    
-    collection = Collection(config.COLLECTION_NAME)
-    collection.load()
+    try:
+        if not utility.has_collection(config.COLLECTION_NAME):
+            raise HTTPException(status_code=404, detail=f"集合 {config.COLLECTION_NAME} 不存在")
+        
+        collection = Collection(config.COLLECTION_NAME)
+        collection.load()
 
-    results = []
-    if request.search_type == 'vector':
-        # 仅向量搜索
-        # query embedding
-        query_embedding = generate_embedding(request.query)
-        # 向量搜索
-        search_results = collection.search(
-            data=[query_embedding],
-            anns_field="embedding",
-            param=config.SEARCH_PARAMS,
-            limit=request.top_k,
-            output_fields=["id", "text", "source", "section", "keywords"]
-        )
+        results = []
+        if request.search_type == 'vector':
+            # 仅向量搜索
+            # query embedding
+            query_embedding = generate_embedding(request.query)
+            # 向量搜索
+            search_results = collection.search(
+                data=[query_embedding],
+                anns_field="embedding",
+                param=config.SEARCH_PARAMS,
+                limit=request.top_k,
+                output_fields=["id", "text", "source", "section", "keywords"]
+            )
 
-        for hits in search_results:
-            for hit in hits:
+            for hits in search_results:
+                for hit in hits:
+                    results.append({
+                        "id": hit.id,
+                        "score": float(1/(1+hit.distance)),  ## 反比函数做归一化，距离越大分数越小
+                        "text": hit.entity.get("text", ""),
+                        "source": hit.entity.get("source", ""),
+                        "section": hit.entity.get("section", ""),
+                        "keywords": hit.entity.get("keywords", ""),
+                    })
+
+        elif request.search_type == 'keyword':
+            # 关键词检索
+            keywords = jieba.analyse.extract_tags(request.query, topK=5)
+
+            keyword_conditions = []
+            for kw in keywords:
+                keyword_conditions.append(f"keywords like '{kw}%'")
+            expr = " or ".join(keyword_conditions) if keyword_conditions else "id > 0"
+
+            query_results = collection.query(
+                expr=expr, 
+                output_fields=["id", "text", "source", "section", "keywords"],
+                limit=request.top_k
+                )
+            
+            for i, hit in enumerate(query_results):
                 results.append({
-                    "id": hit.id,
-                    "score": float(1/(1+hit.distance)),  ## 反比函数做归一化，距离越大分数越小
+                    "id": hit.get("id"),
+                    "score": float(1-(i/len(query_results))),  ## 根据结果排名做一个简单的分数，排名越靠前分数越高
+                    "text": hit.get("text", ""),
+                    "source": hit.get("source", ""),
+                    "section": hit.get("section", ""),
+                    "keywords": hit.get("keywords", ""),
+                })
+
+        elif request.search_type == 'hybrid':
+            # 混合搜索，先向量搜索再关键词过滤
+            query_embedding = generate_embedding(request.query)
+            search_param = {
+                "metric_type": config.METRIC_TYPE,
+                "params": {"nprobe": config.NPROBE} 
+            }
+            vector_results = collection.search(
+                data=[query_embedding],
+                anns_field="embedding",
+                param=search_param,
+                limit=request.top_k*2,
+                output_fields=["id", "text", "source", "section", "keywords"]
+            )
+
+            # 过滤关键词
+            keywords = jieba.analyse.extract_tags(request.query, topK=5)
+            if keywords:
+                keyword_conditions = []
+                for kw in keywords:
+                    keyword_conditions.append(f"keywords like '{kw}%'")
+                expr = " or ".join(keyword_conditions)
+
+                keyword_results = collection.query(
+                    expr=expr, 
+                    output_fields=["id", "text", "source", "section", "keywords"],
+                    limit=request.top_k*2
+                )
+            else:
+                keyword_results = []
+
+
+        # 合并两路搜索的结果
+        result_map = {}
+        # 先处理向量结果
+        for hits in vector_results:
+            for i, hit in enumerate(hits):
+                doc_id = hit.id
+                vector_score = float(1/(1+hit.distance))
+
+                result_map[doc_id] = {
+                    "id": doc_id,
                     "text": hit.entity.get("text", ""),
                     "source": hit.entity.get("source", ""),
                     "section": hit.entity.get("section", ""),
                     "keywords": hit.entity.get("keywords", ""),
-                })
+                    "vector_score": vector_score,
+                    "keyword_score": 0.0
+                }
+        # 再处理关键词结果，更新keyword_score
+        for i, hit in enumerate(keyword_results):
+            doc_id = hit.get("id")
+            keyword_score = float(1-(i / max(1, len(keyword_results))))
+            if doc_id in result_map:
+                result_map[doc_id]["keyword_score"] = float(keyword_score)
+            else:
+                result_map[doc_id] = {
+                    "id": doc_id,
+                    "text": hit.get("text", ""),
+                    "source": hit.get("source", ""),
+                    "section": hit.get("section", ""),
+                    "keywords": hit.get("keywords", ""),
+                    "vector_score": 0.0,
+                    "keyword_score": float(keyword_score)
+                }
+        # 最后根据向量分数和关键词分数加权排序
+        for doc_id, data in result_map.items():
+            data["score"] = request.vector_weight * data["vector_score"] + (1 - request.vector_weight) * data["keyword_score"]
+
+        # 根据最终分数排序并返回top_k结果
+        sorted_results = sorted(result_map.values(), key=lambda x: x["score"], reverse=True)
+        results = sorted_results[:request.top_k]
+
+        return {
+            "query": request.query,
+            "search_type": request.search_type,
+            "total": len(results),
+            "results": results
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
+
 
 @app.post("/insert")
 async def insert(request: InsertRequest):
@@ -130,7 +239,7 @@ async def insert(request: InsertRequest):
                 if f["name"] == "id":
                     fields.append(FieldSchema(name=f["name"], dtype=DataType.INT64, is_primary=True, auto_id=True))
                 elif f["name"] == "embedding":
-                    fields.append(FieldSchema(name=f["name"], dtype=DataType.FLOAT_VECTOR, dimension=config.EMBEDDING_DIMENSION))
+                    fields.append(FieldSchema(name=f["name"], dtype=DataType.FLOAT_VECTOR, dim=config.EMBEDDING_DIMENSION))
                 elif f["type"] == "VARCHAR":
                     fields.append(FieldSchema(name=f["name"], dtype=DataType.VARCHAR, max_length=f["max_length"]))
 
@@ -188,7 +297,7 @@ async def insert_file(file: UploadFile = File(...)):
                     if f["name"] == "id":
                         fields.append(FieldSchema(name=f["name"], dtype=DataType.INT64, is_primary=True, auto_id=True))
                     elif f["name"] == "embedding":
-                        fields.append(FieldSchema(name=f["name"], dtype=DataType.FLOAT_VECTOR, dimension=config.EMBEDDING_DIMENSION))
+                        fields.append(FieldSchema(name=f["name"], dtype=DataType.FLOAT_VECTOR, dim=config.EMBEDDING_DIMENSION))
                     elif f["type"] == "VARCHAR":
                         fields.append(FieldSchema(name=f["name"], dtype=DataType.VARCHAR, max_length=f["max_length"]))
 
